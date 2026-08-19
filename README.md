@@ -16,7 +16,7 @@ The repository was developed within the scope of the TÜBİTAK 3501 research pro
 - **Project No:** `123E294`
 - **Host Institution:** Sivas University of Science and Technology
 - **Principal Investigator:** Assist. Prof. Dr. Nurbanu Güzey
-- **Contributor:** Mehmet Yusuf Ocak
+- **Contributor:** Muhammad Usman, Mehmet Yusuf Ocak
 
 ---
 
