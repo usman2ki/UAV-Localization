@@ -8,6 +8,7 @@ import time
 # LoRa modülünün baud rate'i (ground_station_core ile aynı olmalı)
 LORA_BAUD = 9600
 
+
 class SwarmRadar:
     def __init__(self, root):
         self.root = root
@@ -21,14 +22,17 @@ class SwarmRadar:
         self.CANVAS_SIZE = 600
         self.CENTER = self.CANVAS_SIZE // 2
 
-        # --- Distance estimation, calibrated to the ACTUAL RSSI range your
-        # hardware/sliders produce (-60 to -120 dBm) instead of an arbitrary
-        # 1-meter reference point that's unreachable in practice ---
+        # --- Distance estimation ---
+        # IMPORTANT: RSSI_STRONG / RSSI_WEAK / REAL_MAX_RANGE_M below are
+        # PLACEHOLDERS. Calibrate them with real field readings from YOUR
+        # hardware: note the avg RSSI at a few known distances (e.g. 1m,
+        # 10m, 50m, 100m) and adjust these three numbers to match.
         self.RSSI_STRONG = -60              # avg RSSI when target is essentially on top of the cluster
-        self.RSSI_WEAK = -120               # avg RSSI floor / no-signal
-        self.MIN_RANGE_M = 0.5              # closest representable distance
-        self.MAX_DISPLAY_RANGE_M = 13       # radar's visible radius in meters (edge of canvas)
-        self.NO_SIGNAL_RSSI = self.RSSI_WEAK
+        self.RSSI_WEAK = -125               # avg RSSI at your true max operating range (no more usable signal)
+        self.MIN_RANGE_M = 0.5              # real distance at RSSI_STRONG
+        self.REAL_MAX_RANGE_M = 150         # real distance at RSSI_WEAK (calibration anchor, NOT a display limit)
+        self.NO_SIGNAL_RSSI = self.RSSI_WEAK - 3   # floor below which we treat it as no data at all
+        self.DISPLAY_RING_M = 13            # radar's VISUAL radius on the canvas (independent of real range)
 
         self.drones = {
             1: {"name": "Drone 1 (Kuzey)", "x": 0,              "y": self.OFFSET_M,  "color": "#3498db"},
@@ -38,6 +42,19 @@ class SwarmRadar:
         }
 
         self.rssi = {1: -90, 2: -90, 3: -90, 4: -90}
+
+        # Filtered RSSI used for all distance/direction math. Raw self.rssi
+        # (above) is still what's shown on sliders/log for transparency, but
+        # a single corrupted/noisy LoRa packet on one drone (e.g. a spurious
+        # -119 dBm reading while the other 3 drones read -80ish) should NOT
+        # be allowed to single-handedly flip the near/far mode or swing the
+        # displayed distance by several meters. Two layers of protection:
+        #   1) MAX_STEP_DB: caps how far one packet can move the estimate
+        #   2) EMA_ALPHA: smooths on top of that
+        self.filtered_rssi = dict(self.rssi)
+        self.MAX_STEP_DB = 15
+        self.EMA_ALPHA = 0.3
+
         self.target_visible = True
         self.serial_port = None
         self.is_reading_serial = False
@@ -118,6 +135,13 @@ class SwarmRadar:
                                    font=("Arial", 11), justify=tk.LEFT)
         self.info_label.pack(pady=10, anchor="w")
 
+    def _update_filtered_rssi(self, drone_id, raw_val):
+        """Slew-rate limit + EMA smoothing so one noisy/corrupted packet
+        can't single-handedly swing the distance estimate or flip near/far mode."""
+        prev = self.filtered_rssi.get(drone_id, raw_val)
+        clamped = max(min(raw_val, prev + self.MAX_STEP_DB), prev - self.MAX_STEP_DB)
+        self.filtered_rssi[drone_id] = self.EMA_ALPHA * clamped + (1 - self.EMA_ALPHA) * prev
+
     def toggle_serial(self):
         if not self.is_reading_serial:
             port = self.com_entry.get().strip()
@@ -195,6 +219,7 @@ class SwarmRadar:
 
     def update_from_serial(self, drone_id, rssi_val):
         self.rssi[drone_id] = rssi_val
+        self._update_filtered_rssi(drone_id, rssi_val)
         self.last_update[drone_id] = time.strftime("%H:%M:%S")
         if drone_id in self.sliders:
             self.sliders[drone_id].set(rssi_val)
@@ -204,12 +229,14 @@ class SwarmRadar:
     def on_slider_change(self, drone_id, value):
         if not self.is_reading_serial:
             self.rssi[drone_id] = int(value)
+            self.filtered_rssi[drone_id] = float(value)
             self.update_radar()
 
     def reset_signals(self):
         for d_id in self.sliders:
             self.sliders[d_id].set(-90)
             self.rssi[d_id] = -90
+            self.filtered_rssi[d_id] = -90
         self.update_radar()
 
     def update_radar(self):
@@ -245,19 +272,21 @@ class SwarmRadar:
             self.canvas.create_text(cx, cy + 22, text=data["name"], fill=data["color"], font=("Arial", 8, "bold"))
             self.canvas.create_text(cx, cy - 22, text=f"{self.rssi[d_id]} dBm", fill="white", font=("Arial", 9, "bold"))
 
-        # --- Range ring (visible radar radius) ---
-        ring_r = self.MAX_DISPLAY_RANGE_M * self.SCALE
+        # --- Range ring (visible radar radius — just a display boundary, not the real max range) ---
+        ring_r = self.DISPLAY_RING_M * self.SCALE
         self.canvas.create_oval(self.CENTER - ring_r, self.CENTER - ring_r,
                                  self.CENTER + ring_r, self.CENTER + ring_r,
                                  outline="#34495e", dash=(2, 3))
         self.canvas.create_text(self.CENTER, self.CENTER - ring_r - 10,
-                                 text=f"Menzil Sınırı ~{self.MAX_DISPLAY_RANGE_M:.0f} m",
+                                 text=f"Görüntüleme Sınırı ~{self.DISPLAY_RING_M:.0f} m",
                                  fill="#7f8c8d", font=("Arial", 8))
 
         # Direction comes from the RSSI imbalance between opposing drones (gradient).
-        delta_y = self.rssi[1] - self.rssi[2]
-        delta_x = self.rssi[3] - self.rssi[4]
-        avg_rssi = sum(self.rssi.values()) / len(self.rssi)
+        # Uses FILTERED values (slew-limited + smoothed) so a single corrupted
+        # packet on one drone can't swing the estimate — see _update_filtered_rssi.
+        delta_y = self.filtered_rssi[1] - self.filtered_rssi[2]
+        delta_x = self.filtered_rssi[3] - self.filtered_rssi[4]
+        avg_rssi = sum(self.filtered_rssi.values()) / len(self.filtered_rssi)
 
         dir_mag = math.sqrt(delta_x ** 2 + delta_y ** 2)
         if dir_mag > 1e-6:
@@ -278,14 +307,14 @@ class SwarmRadar:
             near_dist = min(self.K_GAIN * dir_mag, self.OFFSET_M)
 
             # Interpolate in log10(distance) space between the two calibration
-            # anchors (-60 dBm -> MIN_RANGE_M, -120 dBm -> MAX_DISPLAY_RANGE_M).
-            # This matches how RSSI actually relates to distance (linear in dB
-            # vs. log10(distance)) AND stays inside the range your hardware
-            # can really produce, so "strong signal" can correctly resolve
-            # to a near-field distance instead of always reading as far away.
+            # anchors: RSSI_STRONG -> MIN_RANGE_M and RSSI_WEAK -> REAL_MAX_RANGE_M.
+            # This is calibrated against your REAL operating range (e.g. 150m),
+            # separate from DISPLAY_RING_M which only controls how it's drawn.
+            # So a target at 100m now computes an honest ~100m estimate instead
+            # of being compressed toward whatever the old 13m display cap was.
             frac = (self.RSSI_STRONG - avg_rssi) / (self.RSSI_STRONG - self.RSSI_WEAK)
             frac = min(max(frac, 0.0), 1.0)
-            log_d = math.log10(self.MIN_RANGE_M) + frac * (math.log10(self.MAX_DISPLAY_RANGE_M) - math.log10(self.MIN_RANGE_M))
+            log_d = math.log10(self.MIN_RANGE_M) + frac * (math.log10(self.REAL_MAX_RANGE_M) - math.log10(self.MIN_RANGE_M))
             far_dist = 10 ** log_d
 
             inside_cluster = far_dist <= self.OFFSET_M
@@ -298,8 +327,8 @@ class SwarmRadar:
                 real_distance_m = far_dist
                 mode_label = "Uzak Alan (RSSI Mesafe Tahmini)"
 
-            out_of_range = real_distance_m > self.MAX_DISPLAY_RANGE_M
-            display_dist = min(real_distance_m, self.MAX_DISPLAY_RANGE_M)
+            out_of_range = real_distance_m > self.DISPLAY_RING_M
+            display_dist = min(real_distance_m, self.DISPLAY_RING_M)
             target_x_m = dir_x * display_dist
             target_y_m = dir_y * display_dist
 
@@ -338,7 +367,7 @@ class SwarmRadar:
                 f"   Tahmini Mesafe: {real_distance_m:.1f} m\n\n"
                 f"🚀 En Yakın: {nearest_drone}\n"
                 f"   Mesafe: {min_dist:.1f} m\n\n"
-                f"📊 Delta K-G: {delta_y:+d} dBm  |  Delta D-B: {delta_x:+d} dBm\n"
+                f"📊 Delta K-G: {delta_y:+.1f} dBm  |  Delta D-B: {delta_x:+.1f} dBm\n"
                 f"   Ort. RSSI: {avg_rssi:.0f} dBm"
             )
         else:
